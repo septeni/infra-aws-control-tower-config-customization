@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS CloudFormation Template to update config recorder settings in child accounts created by ControlTower.'
+Parameters:
+
+  ExcludedAccounts:
+    Description: Excluded Accounts list. This list should contain Management account, Log Archive and Audit accounts at the minimum
+    Default: "['111111111111', '222222222222', '333333333333']"
+    MaxLength: '2000'
+    MinLength: '36'
+    Type: String
+
+  ConfigRecorderExcludedResourceTypes:
+    Description: List of all resource types to be excluded from Config Recorder
+    Default: "AWS::HealthLake::FHIRDatastore,AWS::Pinpoint::Segment,AWS::Pinpoint::ApplicationSettings"
+    Type: String
+
+  CloudFormationVersion:
+    Type: String
+    Default: 2
+
+Resources:
+    LambdaZipsBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+          BucketEncryption:
+            ServerSideEncryptionConfiguration:
+              - ServerSideEncryptionByDefault:
+                  SSEAlgorithm: AES256
+
+    ProducerLambda:
+        Type: AWS::Lambda::Function
+        DeletionPolicy: Retain
+        DependsOn: CopyZips
+        Properties:
+            #FunctionName: ct_configrecorder_override_producer_cf
+            Code:
+                S3Bucket: !Ref LambdaZipsBucket
+                S3Key: ct-blogs-content/ct_configrecorder_override_producer.zip
+            Handler: ct_configrecorder_override_producer.lambda_handler
+            Role: !GetAtt ProducerLambdaExecutionRole.Arn
+            Runtime: python3.10
+            MemorySize: 128
+            Timeout: 300
+            Architectures:
+                - x86_64
+            ReservedConcurrentExecutions: 1
+            Environment:
+                Variables:
+                    EXCLUDED_ACCOUNTS: !Ref ExcludedAccounts
+                    LOG_LEVEL: INFO
+                    SQS_URL: !Ref SQSConfigRecorder
+
+    ProducerLambdaPermissions:                
+      Type: AWS::Lambda::Permission
+      DeletionPolicy: Retain
+      Properties: 
+        Action: 'lambda:InvokeFunction'
+        FunctionName: !Ref ProducerLambda
+        Principal: 'events.amazonaws.com'
+        SourceArn: !GetAtt ProducerEventTrigger.Arn             
+      
+    ConsumerLambda:
+        Type: AWS::Lambda::Function
+        DeletionPolicy: Retain
+        DependsOn: CopyZips
+        Properties:
+            #FunctionName: ct_configrecorder_override_consumer_cf
+            Code:
+                S3Bucket: !Ref LambdaZipsBucket
+                S3Key: ct-blogs-content/ct_configrecorder_override_consumer_v2.zip
+            Handler: ct_configrecorder_override_consumer.lambda_handler
+            Role: !GetAtt ConsumerLambdaExecutionRole.Arn
+            Runtime: python3.10
+            MemorySize: 128
+            Timeout: 180
+            Architectures:
+                - x86_64
+            ReservedConcurrentExecutions: 10
+            Environment:
+                Variables:
+                    LOG_LEVEL: INFO
+                    CONFIG_RECORDER_EXCLUDED_RESOURCE_LIST: !Ref ConfigRecorderExcludedResourceTypes
+
+    ConsumerLambdaEventSourceMapping:
+        Type: AWS::Lambda::EventSourceMapping
+        DeletionPolicy: Retain
+        Properties:
+          BatchSize: 1
+          Enabled: true
+          EventSourceArn: !GetAtt SQSConfigRecorder.Arn
+          FunctionName: !GetAtt ConsumerLambda.Arn                
+    
+    ProducerLambdaExecutionRole:
+        Type: 'AWS::IAM::Role'
+        DeletionPolicy: Retain
+        Properties:
+          ManagedPolicyArns:
+            - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service:
+                    - lambda.amazonaws.com
+                Action:
+                  - 'sts:AssumeRole'
+          Path: /         
+          Policies:
+            - PolicyName: ct_cro_producer
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - cloudformation:ListStackInstances
+                    Resource: !Sub 'arn:${AWS::Partition}:cloudformation:*:*:stackset/AWSControlTowerBP-BASELINE-CONFIG:*'
+                  - Effect: Allow
+                    Action:
+                      - sqs:DeleteMessage
+                      - sqs:ReceiveMessage
+                      - sqs:SendMessage
+                      - sqs:GetQueueAttributes
+                    Resource: !GetAtt SQSConfigRecorder.Arn  
+                    
+    ConsumerLambdaExecutionRole:
+        Type: 'AWS::IAM::Role'
+        DeletionPolicy: Retain
+        Properties:
+          ManagedPolicyArns:
+            - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+          AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Principal:
+                  Service:
+                    - lambda.amazonaws.com
+                Action:
+                  - 'sts:AssumeRole'
+          Path: /         
+          Policies:
+            - PolicyName: policy-sts-all
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - sts:AssumeRole
+                    Resource: "*"
+                  - Effect: Allow
+                    Action:
+                      - sqs:DeleteMessage
+                      - sqs:ReceiveMessage
+                      - sqs:SendMessage
+                      - sqs:GetQueueAttributes
+                    Resource: !GetAtt SQSConfigRecorder.Arn   
+
+    SQSConfigRecorder:
+        Type: AWS::SQS::Queue
+        DeletionPolicy: Retain
+        Properties:
+            #QueueName: ct_configrecorder_override_cf
+            VisibilityTimeout: 180
+            DelaySeconds: 5
+            KmsMasterKeyId: alias/aws/sqs
+
+    ProducerEventTrigger:
+        Type: AWS::Events::Rule
+        Properties: 
+          Description: "Rule to trigger config recorder override producer lambda"
+          EventBusName: default
+          EventPattern: '{
+                          "source": ["aws.controltower"],
+                          "detail-type": ["AWS Service Event via CloudTrail"],
+                          "detail": {
+                            "eventName": ["UpdateLandingZone", "CreateManagedAccount", "UpdateManagedAccount"]
+                          }
+                        }'
+          Name: !GetAtt SQSConfigRecorder.QueueName #ct_configrecorder_override_cf
+          State: ENABLED
+          Targets: 
+            - 
+                Arn: 
+                  Fn::GetAtt: 
+                    - "ProducerLambda"
+                    - "Arn"
+                Id: "ProducerTarget"
+
+    ProducerLambdaTrigger:
+      Type: 'Custom::ExecuteLambda'
+      Properties:
+        ServiceToken: !GetAtt "ProducerLambda.Arn"
+        FunctionName: !Ref ProducerLambda
+        Version: !Ref CloudFormationVersion
+
+    CopyZips:
+      Type: Custom::CopyZips
+      Properties:
+        ServiceToken: !GetAtt 'CopyZipsFunction.Arn'
+        DestBucket: !Ref 'LambdaZipsBucket'
+        #update this to match AWS public bucket
+        #s3://marketplace-sa-resources/ct-blogs-content/ct_configrecorder_override_consumer_v2.zip
+        #s3://marketplace-sa-resources/ct-blogs-content/ct_configrecorder_override_producer.zip
+        SourceBucket: marketplace-sa-resources
+        Prefix: ct-blogs-content/
+        Objects:
+          - 'ct_configrecorder_override_producer.zip'
+          - 'ct_configrecorder_override_consumer_v2.zip'
+
+    CopyZipsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        Path: /
+        Policies:
+          - PolicyName: lambda-copier
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:GetObjectTagging
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::marketplace-sa-resources/ct-blogs-content/*'
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:PutObjectTagging
+                  Resource:
+                    - !Sub 'arn:${AWS::Partition}:s3:::${LambdaZipsBucket}/ct-blogs-content/*'
+
+    CopyZipsFunction:
+      Type: AWS::Lambda::Function
+      Properties:
+        Description: Copies objects from the S3 bucket to a new location.
+        Handler: index.handler
+        Runtime: python3.10
+        Role: !GetAtt 'CopyZipsRole.Arn'
+        ReservedConcurrentExecutions: 1
+        Timeout: 300
+        Code:
+          ZipFile: |
+            import json
+            import logging
+            import threading
+            import boto3
+            import cfnresponse
+            def copy_objects(source_bucket, dest_bucket, prefix, objects):
+                s3 = boto3.client('s3')
+                for o in objects:
+                    key = prefix + o
+                    copy_source = {
+                        'Bucket': source_bucket,
+                        'Key': key
+                    }
+                    print('copy_source: %s' % copy_source)
+                    print('dest_bucket = %s'%dest_bucket)
+                    print('key = %s' %key)
+                    s3.copy_object(CopySource=copy_source, Bucket=dest_bucket,
+                          Key=key)
+            def delete_objects(bucket, prefix, objects):
+                s3 = boto3.client('s3')
+                objects = {'Objects': [{'Key': prefix + o} for o in objects]}
+                s3.delete_objects(Bucket=bucket, Delete=objects)
+            def timeout(event, context):
+                logging.error('Execution is about to time out, sending failure response to CloudFormation')
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+            def handler(event, context):
+                # make sure we send a failure to CloudFormation if the function
+                # is going to timeout
+                timer = threading.Timer((context.get_remaining_time_in_millis()
+                          / 1000.00) - 0.5, timeout, args=[event, context])
+                timer.start()
+                print('Received event: %s' % json.dumps(event))
+                status = cfnresponse.SUCCESS
+                try:
+                    source_bucket = event['ResourceProperties']['SourceBucket']
+                    dest_bucket = event['ResourceProperties']['DestBucket']
+                    prefix = event['ResourceProperties']['Prefix']
+                    objects = event['ResourceProperties']['Objects']
+                    if event['RequestType'] == 'Delete':
+                        delete_objects(dest_bucket, prefix, objects)
+                    else:
+                        copy_objects(source_bucket, dest_bucket, prefix, objects)
+                except Exception as e:
+                    logging.error('Exception: %s' % e, exc_info=True)
+                    status = cfnresponse.FAILED
+                finally:
+                    timer.cancel()
+                    cfnresponse.send(event, context, status, {}, None)
