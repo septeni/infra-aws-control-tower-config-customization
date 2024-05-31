@@ -1,23 +1,3 @@
-#
-# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
-# SPDX-License-Identifier: MIT-0
-#
-# Permission is hereby granted, free of charge, to any person obtaining
-# a copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify,merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
-# OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
-#
-
 import boto3
 import json
 import logging
@@ -85,40 +65,49 @@ def lambda_handler(event, context):
 
         # ControlTower created configuration recorder with name "aws-controltower-BaselineConfigRecorder" and we will update just that
         try:
-            role_arn = 'arn:aws:iam::' + account_id + ':role/aws-controltower-ConfigRecorderRole'
+            role_arn = 'arn:aws:iam::' + account_id + ':role/aws-service-role/config.amazonaws.com/AWSServiceRoleForConfig'
 
             CONFIG_RECORDER_EXCLUSION_RESOURCE_STRING = os.getenv('CONFIG_RECORDER_EXCLUDED_RESOURCE_LIST')
             CONFIG_RECORDER_EXCLUSION_RESOURCE_LIST = CONFIG_RECORDER_EXCLUSION_RESOURCE_STRING.split(',')
 
             # Event = Delete is when stack is deleted, we rollback changed made and leave it as ControlTower Intended
             if event == 'Delete':
-                response = configservice.put_configuration_recorder(
-                    ConfigurationRecorder={
-                        'name': 'aws-controltower-BaselineConfigRecorder',
-                        'roleARN': role_arn,
-                        'recordingGroup': {
-                            'allSupported': True,
-                            'includeGlobalResourceTypes': False
-                        }
-                    })
+
+                # Define request json
+                request_json = {
+                    'name': 'aws-controltower-BaselineConfigRecorder',
+                    'roleARN': role_arn,
+                    'recordingGroup': {
+                        'allSupported': True,
+                        'includeGlobalResourceTypes': False
+                    }
+                }
+                logging.info(f'Request json :{request_json}')
+
+                # Request API
+                response = configservice.put_configuration_recorder(ConfigurationRecorder=request_json)
                 logging.info(f'Response for put_configuration_recorder :{response} ')
 
             else:
-                response = configservice.put_configuration_recorder(
-                    ConfigurationRecorder={
-                        'name': 'aws-controltower-BaselineConfigRecorder',
-                        'roleARN': role_arn,
-                        'recordingGroup': {
-                            'allSupported': False,
-                            'includeGlobalResourceTypes': False,
-                            'exclusionByResourceTypes': {
-                                'resourceTypes': CONFIG_RECORDER_EXCLUSION_RESOURCE_LIST
-                            },
-                            'recordingStrategy': {
-                                'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'
-                            }
+                # Define request json
+                request_json = {
+                    'name': 'aws-controltower-BaselineConfigRecorder',
+                    'roleARN': role_arn,
+                    'recordingGroup': {
+                        'allSupported': False,
+                        'includeGlobalResourceTypes': False,
+                        'exclusionByResourceTypes': {
+                            'resourceTypes': CONFIG_RECORDER_EXCLUSION_RESOURCE_LIST
+                        },
+                        'recordingStrategy': {
+                            'useOnly': 'EXCLUSION_BY_RESOURCE_TYPES'
                         }
-                    })
+                    }
+                }
+                logging.info(f'Request json :{request_json}')
+
+                # Request API
+                response = configservice.put_configuration_recorder(ConfigurationRecorder=request_json)
                 logging.info(f'Response for put_configuration_recorder :{response} ')
 
             # lets describe for configuration recorder after the update
